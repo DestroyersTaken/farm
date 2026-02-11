@@ -393,6 +393,63 @@ local function startScanner(name)
 end
 
 -- ===== Movement =====
+local function waitForShieldGone(timeoutSecs)
+    setStatus("Waiting for shield…")
+    local t0 = tick()
+    local gone = false
+    local timeout = timeoutSecs or 8
+    while tick() - t0 < timeout do
+        local char = LocalPlayer.Character
+        local ff = char and char:FindFirstChildWhichIsA("ForceField")
+        if not ff then
+            gone = true
+            break
+        end
+        RunService.Heartbeat:Wait()
+    end
+    setStatus(gone and "Shield gone." or "Shield timeout, proceed.")
+    return gone
+end
+
+local function anchoredShieldWaitAboveTarget(targetPos, waitHeight)
+    local holdY = (waitHeight or 100)
+    local holdPos = Vector3.new(targetPos.X, targetPos.Y + holdY, targetPos.Z)
+
+    local hrp = tpTo(holdPos)
+    local t0 = tick()
+    local timeout = 8
+
+    while tick() - t0 < timeout do
+        local char = LocalPlayer.Character
+        if not char then break end
+
+        local ff = char:FindFirstChildWhichIsA("ForceField")
+        if not ff then
+            break
+        end
+
+        local currentHrp = char:FindFirstChild("HumanoidRootPart")
+        if currentHrp then
+            hrp = currentHrp
+            hrp.Anchored = true
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            hrp.CFrame = CFrame.new(holdPos)
+        end
+
+        RunService.Heartbeat:Wait()
+    end
+
+    local finalChar = LocalPlayer.Character
+    local finalHrp = finalChar and finalChar:FindFirstChild("HumanoidRootPart")
+    if finalHrp then
+        finalHrp.Anchored = false
+    end
+
+    waitForShieldGone(8)
+
+    return finalHrp or hrp
+end
 local function waitForShieldGone(char, timeoutSecs)
     setStatus("Waiting for shield…")
     local t0 = tick()
@@ -420,6 +477,25 @@ local function anchoredShieldWaitAboveTarget(targetPos, waitHeight)
 
     hrp.Anchored = false
     return hrp
+end
+
+local function pickSafeGroundNearTarget(targetPos, minDist, maxDist)
+    local minR = minDist or 55
+    local maxR = math.max(minR + 1, maxDist or 105)
+
+    local fallbackG = nil
+    for _ = 1, 6 do
+        local offX, offZ = ringOffset(minR, maxR)
+        local g = groundAt(targetPos.X + offX, targetPos.Z + offZ)
+        fallbackG = fallbackG or g
+
+        local planarDist = (Vector3.new(g.X, 0, g.Z) - Vector3.new(targetPos.X, 0, targetPos.Z)).Magnitude
+        if planarDist >= minR then
+            return g
+        end
+    end
+
+    return fallbackG or groundAt(targetPos.X + minR, targetPos.Z)
 end
 
 local function pickSafeGroundNearTarget(targetPos, minDist, maxDist)
