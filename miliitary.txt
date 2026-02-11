@@ -1,0 +1,942 @@
+-- File: /xp_bot_autostart_stats.lua
+-- Target flow: FLAG → HOVER & SCAN (while shield) → SAVE (memory) → TP to SAVED → background rescan.
+-- If SAVED stale/missing → back to FLAG. lastPos is in-memory ONLY (resets on rejoin).
+
+-- ===== Services =====
+local Players      = game:GetService("Players")
+local RS           = game:GetService("ReplicatedStorage")
+local UIS          = game:GetService("UserInputService")
+local Http         = game:GetService("HttpService")
+local RunService   = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Workspace    = game:GetService("Workspace")
+local LocalPlayer  = Players.LocalPlayer
+
+-- ===== Default per-user UUID presets =====
+local DEFAULT_UUIDS = {
+    ["teirtza9774"]       = "84f677ed-2fd6-4aa4-b558-ccf6a85067e4",
+    ["Vortex_SONIC2016"]  = "6855de6f-096e-4638-a2fa-5ba4b5103460",
+    ["BlockH3roAqua2006"] = "ced3ff09-c1a5-4b95-9daf-27ac9875c61f",
+    ["Craz3Eagl3Cooki3"]  = "9dee014f-04e9-4070-a2eb-b26b83134d5b",
+    ["doug240569"]        = "382d7f11-5252-4d06-bc6f-0af403abeb42",
+    ["maged211265"]       = "4c013290-61d7-489d-914d-4e2105036295",
+    ["jr990960"]          = "53b47b23-9aa4-42a0-8d56-03f35dd441c8",
+    ["dawna235421"]       = "eb0bfa41-e5af-49a4-822e-d65aadb2264c",
+    ["HarperTigerLight"]  = "067c2bd8-5bd4-4170-add2-4c325228e80f",
+    ["debby671021"]	  = "ec8e86d7-e7e4-4ce4-a54b-59103c9c5dd6",
+    ["cassaundra3078"]	  = "9ac3a9ef-02a9-48a8-81b7-4959bb729d26",
+    ["sinead8053"]	  = "92ca06fc-b80a-4d2d-8559-be6433e3ae9f",
+    ["leroy9985"]	  = "2248fcc0-5df4-402c-a914-24e0de3adbc7",
+    ["selah077056"]	  = "eff84867-e8bc-46ec-8610-7a0016c8d665",
+
+}
+
+local function getPresetUUIDForLocal()
+    local u = DEFAULT_UUIDS[LocalPlayer.Name]
+    if u and u ~= "" then
+        return u, ("Preset (%s)"):format(LocalPlayer.Name)
+    end
+    return nil, nil
+end
+
+-- ===== Behavior toggles =====
+local AUTO_START          = true
+local START_TAB           = "Stats"
+local XP_PER_DEATH        = 7000
+local AUTO_SELECT_TYCOON  = true
+local TYCOON_REGION       = "USA"
+local SELECT_DELAY_SEC    = 1
+
+-- cycle targets automatically (funkychunk → Xanmaneerr → …)
+local CYCLE_TARGETS       = true
+
+-- ===== Config (per-user) =====
+local CONFIG_FILE = ("xpbot_%s.json"):format(LocalPlayer.UserId)
+local config = {
+    savedTarget = nil,
+    vehicles = {},
+    activeVehicleLabel = nil,
+    detectUuid = false, -- GUI toggle
+}
+-- In-memory ONLY (reset on rejoin)
+local lastPos = {}          -- [playerName] = { v = Vector3, t = number }
+local scanToken = 0         -- single scanner token
+local scanTarget = nil      -- name currently scanned
+
+local function hasFS() return typeof(writefile)=="function" and typeof(readfile)=="function" end
+local function loadConfig()
+    if not hasFS() then return end
+    local ok, data = pcall(readfile, CONFIG_FILE)
+    if ok and data and #data>0 then
+        local ok2, t = pcall(Http.JSONDecode, Http, data)
+        if ok2 and typeof(t)=="table" then
+            config.savedTarget        = t.savedTarget
+            config.vehicles           = t.vehicles or {}
+            config.activeVehicleLabel = t.activeVehicleLabel
+            if typeof(t.detectUuid)=="boolean" then config.detectUuid = t.detectUuid end
+        end
+    end
+end
+local function saveConfig()
+    if not hasFS() then return end
+    local ok, data = pcall(Http.JSONEncode, Http, config)
+    if ok then pcall(writefile, CONFIG_FILE, data) end
+end
+
+-- ===== Small helpers =====
+local function mk(parent, class, props) local o=Instance.new(class) for k,v in pairs(props or {}) do o[k]=v end o.Parent=parent return o end
+local function trim(s) return (tostring(s or ""):gsub("^%s+",""):gsub("%s+$","")) end
+local function nonEmpty(s) s=tostring(s or "") return s~="" and trim(s)~="" end
+local function safeGetClipboard() if typeof(getclipboard)=="function" then local ok,v=pcall(getclipboard) if ok and v then return tostring(v) end end end
+local function now() return tick() end
+
+-- Emulator-friendly draggable
+local function makeDraggable(dragHandle, moveFrame)
+    dragHandle.Active, moveFrame.Active = true, true
+    local dragging, activeInput = false, nil
+    local dragStart, frameStart
+    local function viewport() local cam=Workspace.CurrentCamera return cam and cam.ViewportSize or Vector2.new(1920,1080) end
+    local function clampToScreen(pos)
+        local vp=viewport()
+        local x = math.clamp(pos.X.Offset, 0, math.max(0, vp.X - moveFrame.Size.X.Offset))
+        local y = math.clamp(pos.Y.Offset, 0, math.max(0, vp.Y - moveFrame.Size.Y.Offset))
+        return UDim2.new(0,x,0,y)
+    end
+    dragHandle.InputBegan:Connect(function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then
+            dragging=true; activeInput=input
+            dragStart = UIS:GetMouseLocation()
+            frameStart = Vector2.new(moveFrame.Position.X.Offset, moveFrame.Position.Y.Offset)
+            input.Changed:Connect(function() if input.UserInputState==Enum.UserInputState.End then dragging=false activeInput=nil end end)
+        end
+    end)
+    UIS.InputEnded:Connect(function(input) if input==activeInput then dragging=false activeInput=nil end end)
+    RunService.RenderStepped:Connect(function()
+        if not dragging or not activeInput then return end
+        local cur = UIS:GetMouseLocation()
+        local delta = cur - dragStart
+        moveFrame.Position = clampToScreen(UDim2.new(0, frameStart.X + delta.X, 0, frameStart.Y + delta.Y))
+    end)
+end
+
+-- ===== UI/state =====
+local loopRunning, runnerActive = false, false
+local lastDetectedUUID = ""
+local statusText, activeTargetText, vehicleActiveText, vehicleDetectedText
+local targetInput, tabMain, tabVehicle, tabStats, targetsSF, targetsList, vehiclesSF, vehiclesList
+local rootWindow, restoreButton
+
+-- === Auto-resize constants/helpers ===
+local BASE_UI_SIZE = Vector2.new(420, 280)
+
+local function getViewportSize()
+    local cam = Workspace.CurrentCamera
+    if cam then return cam.ViewportSize end
+    return Vector2.new(1920, 1080)
+end
+
+local function fitRootToViewport()
+    if not rootWindow then return end
+
+    local vp = getViewportSize()
+    local paddingX, paddingY = 16, 32
+
+    local maxW = math.max(64, vp.X - paddingX)
+    local maxH = math.max(64, vp.Y - paddingY)
+
+    local scale = math.min(maxW / BASE_UI_SIZE.X, maxH / BASE_UI_SIZE.Y, 1)
+    if scale <= 0 then scale = 0.1 end
+
+    local w = math.floor(BASE_UI_SIZE.X * scale + 0.5)
+    local h = math.floor(BASE_UI_SIZE.Y * scale + 0.5)
+
+    rootWindow.Size = UDim2.new(0, w, 0, h)
+    rootWindow.Position = UDim2.new(0.5, -w/2, 0.5, -h/2)
+end
+
+local function hookViewportResize()
+    local function connectCam(cam)
+        if not cam then return end
+        cam:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            fitRootToViewport()
+        end)
+    end
+
+    connectCam(Workspace.CurrentCamera)
+
+    Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+        connectCam(Workspace.CurrentCamera)
+        fitRootToViewport()
+    end)
+end
+
+-- Stats (true average between deaths)
+local startTime, deathCount, firstDeathAt, lastDeathAt, deathIntervalSum = tick(), 0, nil, nil, 0
+local lastActionLabel, totalXPLabel, avgDeathLabel, sessionTimeLabel
+
+-- Flight tuning
+local ascendHeight, randomLandingRadius, safeLandingDistance = 200, 75, 35
+
+-- ===== Targets / cycling =====
+local targetPriorityList = { "funkychunk", "Xanmaneerr", "louisrene7736", "laumb3ks" }
+
+-- cycle state
+local cycleIndex = 0
+local lastCycleTarget = nil
+
+local function setStatus(msg)
+    if statusText then statusText.Text = msg end
+    if lastActionLabel then lastActionLabel.Text = "Last: "..msg end
+end
+
+local function isPlayerOnline(name)
+    if not name then return false end
+    return Players:FindFirstChild(name) ~= nil
+end
+
+local function determineActiveTarget()
+    if config.savedTarget and isPlayerOnline(config.savedTarget) then return config.savedTarget, "Saved" end
+    for _,n in ipairs(targetPriorityList) do if isPlayerOnline(n) then return n, "Priority" end end
+    if config.savedTarget then return config.savedTarget, "Saved (offline)" end
+    return nil, "None"
+end
+
+-- NEW: get next target in cycle (only online ones), fallback to old behavior
+local function getNextCycleTarget()
+    local online = {}
+    for _, name in ipairs(targetPriorityList) do
+        if isPlayerOnline(name) then
+            table.insert(online, name)
+        end
+    end
+
+    if #online == 0 then
+        -- nobody from the list online → use old logic
+        return determineActiveTarget()
+    end
+
+    if cycleIndex < 1 or cycleIndex > #online then
+        cycleIndex = 1
+    else
+        cycleIndex = cycleIndex + 1
+        if cycleIndex > #online then
+            cycleIndex = 1
+        end
+    end
+
+    local name = online[cycleIndex]
+    lastCycleTarget = name
+    return name, ("Cycle %d/%d"):format(cycleIndex, #online)
+end
+
+local function refreshActiveTargetLabel()
+    if not activeTargetText then return end
+
+    -- When cycling, show the current cycle target if we have one
+    if CYCLE_TARGETS and lastCycleTarget then
+        activeTargetText.Text = ("Target: %s  (%s)"):format(lastCycleTarget, "Cycle")
+        return
+    end
+
+    -- Otherwise fall back to saved/priority logic
+    local n, why = determineActiveTarget()
+    if n then
+        activeTargetText.Text = ("Target: %s  (%s)"):format(n, why)
+    else
+        activeTargetText.Text = "Target: none"
+    end
+end
+
+-- ===== UUID capture =====
+do
+    local rfSpawn
+    local ok, svc = pcall(function()
+        return RS:WaitForChild("Packages",9e9):WaitForChild("_Index",9e9)
+            :WaitForChild("sleitnick_knit@1.5.1",9e9):WaitForChild("knit",9e9)
+            :WaitForChild("Services",9e9):WaitForChild("VehicleService",9e9)
+            :WaitForChild("RF",9e9)
+    end)
+    if ok and svc then rfSpawn = svc:WaitForChild("Spawn",9e9) end
+    local old; old = hookmetamethod(game,"__namecall",function(self,...)
+        local m = getnamecallmethod and getnamecallmethod() or ""
+        if m=="InvokeServer" and rfSpawn and self==rfSpawn then
+            if config.detectUuid then
+                local uuid = tostring(({...})[1] or "")
+                if uuid and #uuid>=8 then
+                    lastDetectedUUID = uuid
+                    if vehicleDetectedText then vehicleDetectedText.Text = "Detected UUID: "..uuid end
+                    if vehicleActiveText and not (config.activeVehicleLabel and config.vehicles[config.activeVehicleLabel]) then
+                        vehicleActiveText.Text = ("Active Vehicle: %s  •  %s"):format(lastDetectedUUID, "Base (last detected)")
+                    end
+                end
+            end
+        end
+        return old(self,...)
+    end)
+end
+
+-- ===== Remotes =====
+local function getRemote(path) local n=RS for _,p in ipairs(path) do n=n:WaitForChild(p,9e9) end return n end
+local function instantRespawn() getRemote({"Packages","_Index","sleitnick_knit@1.5.1","knit","Services","CharacterService","RF","Respawn"}):InvokeServer() end
+
+-- ===== UUID selection (saved → preset → last detected) =====
+local function getActiveUUIDOrBase()
+    local lbl = config.activeVehicleLabel
+    if lbl and config.vehicles[lbl] and config.vehicles[lbl] ~= "" then
+        return config.vehicles[lbl], ("Active: %s"):format(lbl)
+    end
+    local preset, whyPreset = getPresetUUIDForLocal()
+    if preset then
+        return preset, whyPreset
+    end
+    if lastDetectedUUID ~= "" then
+        return lastDetectedUUID, "Base (last detected)"
+    end
+    return nil, "None"
+end
+
+local function spawnVehicleUuid()
+    local uuid, why = getActiveUUIDOrBase()
+    if not uuid then setStatus("No UUID. Paste/save, use preset, or enable detect + spawn once.") return false end
+    local rf = getRemote({"Packages","_Index","sleitnick_knit@1.5.1","knit","Services","VehicleService","RF","Spawn"})
+    local ok, err = pcall(function() rf:InvokeServer(uuid) end)
+    if not ok then setStatus("Spawn failed: "..tostring(err)) return false end
+    setStatus("Spawned ("..why..")") return true
+end
+
+-- ===== Targeting helpers (robust) =====
+local function findPlayerInsensitive(name)
+    if not name then return nil end
+    local want = tostring(name):lower()
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p.Name:lower()==want then return p end
+    end
+    return nil
+end
+local function getLiveHRPFromCharacter(char)
+    if not char then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp and hrp:IsA("BasePart") then return hrp end
+    for _,d in ipairs(char:GetDescendants()) do
+        if d:IsA("BasePart") and d.Name:lower():find("root") then return d end
+    end
+    return nil
+end
+local function getLiveHRPByPlayerName(name)
+    local p = findPlayerInsensitive(name)
+    if not p then return nil end
+    local char = p.Character or p.CharacterAdded:Wait()
+    return getLiveHRPFromCharacter(char)
+end
+
+-- Flag finder (robust across Model/BasePart)
+local function findFlagPart(name)
+    local ff = Workspace:FindFirstChild("FlagFolder") if not ff then return end
+    for _,c in ipairs(ff:GetChildren()) do
+        if c.Name==name then
+            if c:IsA("BasePart") then return c end
+            if c:IsA("Model") then
+                return c:FindFirstChild("HumanoidRootPart") or c.PrimaryPart or c:FindFirstChildWhichIsA("BasePart")
+            end
+        end
+    end
+end
+
+-- Grounding and landing ring
+local function groundAt(x, z)
+    local origin, dir = Vector3.new(x, 1000, z), Vector3.new(0, -2000, 0)
+    local rp = RaycastParams.new()
+    rp.FilterType = Enum.RaycastFilterType.Blacklist
+    rp.FilterDescendantsInstances = {LocalPlayer.Character}
+    local hit = Workspace:Raycast(origin, dir, rp)
+    return hit and hit.Position or Vector3.new(x, 10, z)
+end
+local function ringOffset(rmin, rmax)
+    rmin = math.max(10, rmin or 35); rmax = math.max(rmin+1, rmax or 85)
+    local r = math.random(rmin*100, rmax*100)/100
+    local t = math.random()*math.pi*2
+    return math.cos(t)*r, math.sin(t)*r
+end
+
+-- In-memory saved pos (freshness check)
+local FRESH_TTL = 120 -- seconds; longer so cycle mode can reuse positions
+local function getFreshSaved(name)
+    local rec = name and lastPos[name]
+    if not rec then return nil end
+    if now() - rec.t <= FRESH_TTL then return rec.v end
+    return nil
+end
+local function setSaved(name, v3)
+    if not name or not v3 then return end
+    lastPos[name] = { v = v3, t = now() }
+end
+local function clearSaved(name)
+    if name then lastPos[name] = nil end
+end
+
+-- Scanner (single instance per target)
+local function stopScanner()
+    scanToken += 1
+    scanTarget = nil
+end
+local function startScanner(name)
+    stopScanner()
+    scanTarget = name
+    local my = scanToken
+    task.spawn(function()
+        while my == scanToken and scanTarget == name do
+            local hrp = getLiveHRPByPlayerName(name)
+            if hrp then setSaved(name, hrp.Position) end
+            RunService.Heartbeat:Wait() RunService.Heartbeat:Wait()
+        end
+    end)
+end
+
+-- ===== Movement =====
+local function waitForShieldGone(char)
+    setStatus("Waiting for shield…")
+    local t0 = tick()
+    local gone = false
+    while tick() - t0 < 10 do
+        local ff = char:FindFirstChildWhichIsA("ForceField")
+        if not ff then
+            gone = true
+            break
+        end
+        RunService.Heartbeat:Wait()
+    end
+    setStatus(gone and "Shield gone." or "Shield timeout, proceed.")
+end
+
+local function descendDown(hrp)
+    setStatus("Descending…"); hrp.Anchored=false
+    local rp=RaycastParams.new() rp.FilterDescendantsInstances={LocalPlayer.Character} rp.FilterType=Enum.RaycastFilterType.Blacklist
+    local t0=tick()
+    while tick()-t0<10 do
+        local res=Workspace:Raycast(hrp.Position, Vector3.new(0,-50,0), rp)
+        if res then
+            local targetY=res.Position.Y+5
+            if hrp.Position.Y - targetY <= 5 then hrp.CFrame=CFrame.new(hrp.Position.X, targetY, hrp.Position.Z) break
+            else local dt=RunService.Heartbeat:Wait() hrp.CFrame=hrp.CFrame-Vector3.new(0,50*dt,0) end
+        else local dt=RunService.Heartbeat:Wait() hrp.CFrame=hrp.CFrame-Vector3.new(0,50*dt,0) end
+    end
+end
+
+-- ===== Teleport primitives =====
+-- NOTE: this is a *raw* TP; no shield waiting here anymore.
+local function tpTo(v3)
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    local hrp  = char:WaitForChild("HumanoidRootPart")
+    local goal = Vector3.new(v3.X, v3.Y, v3.Z)
+    local ok = pcall(function() LocalPlayer.Character:SetPrimaryPartCFrame(CFrame.new(goal)) end)
+    if not ok or (hrp.Position - goal).Magnitude > 14 then
+        hrp.CFrame = CFrame.new(goal)
+    end
+    return hrp
+end
+
+-- ===== Flag-first sequence (updated) =====
+
+-- helper: while we still have shield, keep scanning target to save its pos
+local function scanWhileShieldAndSave(name, maxSecs)
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    local deadline = now() + (maxSecs or 10)
+    local savedOnce = false
+
+    while now() < deadline do
+        local ff = char:FindFirstChildWhichIsA("ForceField")
+        if not ff then
+            -- shield gone, stop loop
+            break
+        end
+
+        local hrp = getLiveHRPByPlayerName(name)
+        if hrp then
+            setSaved(name, hrp.Position)
+            savedOnce = true
+        end
+
+        RunService.Heartbeat:Wait()
+    end
+
+    return savedOnce
+end
+
+-- Uses fresh saved if present; otherwise:
+-- 1) TP high above flag
+-- 2) Scan while shield exists
+-- 3) Start scanner
+-- 4) When shield is gone, TP near saved target & land
+local function goToSavedOrFlag(name)
+    -- If we already have a fresh saved position, just go near it
+    local fresh = getFreshSaved(name)
+    if fresh then
+        local offX, offZ = ringOffset(35, 85)
+        local g = groundAt(fresh.X + offX, fresh.Z + offZ)
+        setStatus(("TP near saved %s…"):format(name))
+        local hrp = tpTo(Vector3.new(g.X, g.Y + 6, g.Z))
+
+        local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+        waitForShieldGone(char)
+
+        hrp.Anchored = false
+        descendDown(hrp)
+        return true
+    end
+
+    -- No fresh saved: use flag as reference
+    local flag = findFlagPart(name)
+    if not flag then
+        setStatus("Flag not found; idle…")
+        return false
+    end
+
+    local base = flag.Position
+    local offX, offZ = ringOffset(35, 85)
+    local g = groundAt(base.X + offX, base.Z + offZ)
+    local hover = Vector3.new(g.X, g.Y + 75, g.Z) -- hover higher so we don't get stuck in ground
+
+    setStatus(("TP above flag (%s)…"):format(name))
+    tpTo(hover)
+
+    -- While shield is up, just scan and save target positions
+    setStatus("Scanning target while shield…")
+    scanWhileShieldAndSave(name, 10)
+
+    -- Kick off background scanner to keep updating
+    startScanner(name)
+
+    -- Use whatever we have saved so far
+    local saved = getFreshSaved(name) or (lastPos[name] and lastPos[name].v)
+    if not saved then
+        setStatus("Saved position missing; retry next cycle.")
+        return false
+    end
+
+    local offX2, offZ2 = ringOffset(35, 85)
+    local g2 = groundAt(saved.X + offX2, saved.Z + offZ2)
+    setStatus(("TP near live %s…"):format(name))
+    local hrp = tpTo(Vector3.new(g2.X, g2.Y + 6, g2.Z))
+
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    waitForShieldGone(char)
+
+    hrp.Anchored = false
+    descendDown(hrp)
+    return true
+end
+
+-- ===== Stats =====
+local function formatXP(xp) if xp>=1e6 then return string.format("%.1fm", xp/1e6) elseif xp>=1e3 then return string.format("%.1fk", xp/1e3) else return tostring(xp) end end
+local function formatElapsed(secs)
+    local d=math.floor(secs/86400) local h=math.floor((secs%86400)/3600) local m=math.floor((secs%3600)/60) local s=math.floor(secs%60)
+    if d>0 then return string.format("%dd %dh %dm", d,h,m) end
+    if h>0 then return string.format("%dh %dm", h,m) end
+    if m>0 then return string.format("%dm %ds", m,s) end
+    return string.format("%ds", s)
+end
+local function updateStatsGUI()
+    if not totalXPLabel then return end
+    local elapsed=tick()-startTime
+    local totalXP=deathCount*XP_PER_DEATH
+    local avgSecs=0
+    if deathCount>=2 and deathIntervalSum>0 then avgSecs=deathIntervalSum/(deathCount-1)
+    elseif deathCount==1 and firstDeathAt then avgSecs=(tick()-firstDeathAt) end
+    totalXPLabel.Text     = "Total XP: "..formatXP(totalXP)
+    sessionTimeLabel.Text = "Session: "..formatElapsed(elapsed)
+    avgDeathLabel.Text    = "Avg Death: "..formatElapsed(avgSecs)
+end
+
+-- ===== Core flight entry =====
+local function fullFlight()
+    local targetName, why
+    if CYCLE_TARGETS then
+        targetName, why = getNextCycleTarget()
+    else
+        targetName, why = determineActiveTarget()
+    end
+
+    if not targetName then
+        setStatus("No target set; idle…")
+        task.wait(0.6)
+        return
+    end
+
+    if activeTargetText then
+        activeTargetText.Text = ("Target: %s  (%s)"):format(targetName, why or "Target")
+    end
+
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    char:WaitForChild("HumanoidRootPart") -- just ensure loaded
+
+    if not spawnVehicleUuid() then
+        task.wait(0.6)
+        return
+    end
+
+    goToSavedOrFlag(targetName)
+    updateStatsGUI()
+end
+
+-- ===== Death/loop =====
+local function registerDeath(nowTime)
+    deathCount += 1
+    if not firstDeathAt then
+        firstDeathAt=nowTime
+    else
+        if lastDeathAt then deathIntervalSum += (nowTime - lastDeathAt) end
+    end
+    lastDeathAt = nowTime
+    updateStatsGUI()
+end
+local function waitUntilDead()
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    local hum  = char:WaitForChild("Humanoid")
+    if hum.Health<=0 then registerDeath(now()) return true end
+    local died=false; local conn; conn=hum.Died:Connect(function() died=true end)
+    local t0=tick() while not died and tick()-t0<20 do RunService.Heartbeat:Wait() end
+    if conn and conn.Connected then conn:Disconnect() end
+    if died then registerDeath(now()) task.wait(1) return true else instantRespawn() task.wait(1) return false end
+end
+local function runLoop()
+    if runnerActive then return end
+    runnerActive=true
+    task.spawn(function()
+        while loopRunning do
+            refreshActiveTargetLabel()
+            setStatus("Waiting for death…")
+            waitUntilDead()
+            setStatus("Respawning…") instantRespawn() task.wait(0.4)
+            fullFlight()
+            task.wait(0.4)
+        end
+        runnerActive=false
+    end)
+end
+
+-- ===== Lists =====
+local function updateCanvas(sf, inner)
+    local sum=0 for _,c in ipairs(inner:GetChildren()) do if c:IsA("GuiObject") then sum+=c.AbsoluteSize.Y end end
+    sum += 6 * #inner:GetChildren() sf.CanvasSize=UDim2.new(0,0,0, math.max(sum, sf.AbsoluteSize.Y))
+end
+local targetsListBuildOnce=false
+local function rebuildTargetsList()
+    if targetsListBuildOnce then return end
+    targetsListBuildOnce=true
+    targetsList:ClearAllChildren() mk(targetsList,"UIListLayout",{Padding=UDim.new(0,6)})
+    for _,n in ipairs(targetPriorityList) do
+        local b = mk(targetsList,"TextButton",{Size=UDim2.new(1,0,0,28), Text=n, Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.fromRGB(240,240,255), BackgroundColor3=Color3.fromRGB(42,44,60)})
+        mk(b,"UICorner",{CornerRadius=UDim.new(0,8)})
+        b.MouseButton1Click:Connect(function() targetInput.Text=n targetsSF.Visible=false end)
+    end
+    updateCanvas(targetsSF, targetsList)
+end
+local function rebuildVehiclesList()
+    vehiclesList:ClearAllChildren() mk(vehiclesList,"UIListLayout",{Padding=UDim.new(0,6)})
+    for label, uuid in pairs(config.vehicles) do
+        local row = mk(vehiclesList,"Frame",{BackgroundTransparency=1, Size=UDim2.new(1,0,0,28)})
+        local pick= mk(row,"TextButton",{Size=UDim2.new(0.72,0,1,0), Text=("%s  ·  %s"):format(label, uuid:sub(1,8).."…"), Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.fromRGB(240,240,255), BackgroundColor3=Color3.fromRGB(42,44,60)})
+        mk(pick,"UICorner",{CornerRadius=UDim.new(0,8)})
+        pick.MouseButton1Click:Connect(function()
+            config.activeVehicleLabel=label saveConfig()
+            vehicleActiveText.Text=("Active Vehicle: %s  •  %s"):format(uuid, "Active: "..label)
+            setStatus("Active vehicle set.")
+        end)
+        local del = mk(row,"TextButton",{Size=UDim2.new(0.26,0,1,0), Position=UDim2.new(0.74,0,0,0), Text="Delete", Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.fromRGB(255,230,230), BackgroundColor3=Color3.fromRGB(140,70,70)})
+        mk(del,"UICorner",{CornerRadius=UDim.new(0,8)})
+        del.MouseButton1Click:Connect(function()
+            if config.vehicles[label] then
+                config.vehicles[label]=nil
+                if config.activeVehicleLabel==label then config.activeVehicleLabel=next(config.vehicles) end
+                saveConfig() rebuildVehiclesList()
+                local u,w = getActiveUUIDOrBase()
+                vehicleActiveText.Text=("Active Vehicle: %s  •  %s"):format(u or "—", w)
+                setStatus("Vehicle deleted.")
+            end
+        end)
+    end
+    updateCanvas(vehiclesSF, vehiclesList)
+end
+
+-- ===== UI =====
+local showTab
+local function buildPillToggle(parent, text, initialOn, onChanged)
+    local row = mk(parent,"Frame",{BackgroundTransparency=1, Size=UDim2.new(1,0,0,32)})
+    local lbl = mk(row,"TextLabel",{BackgroundTransparency=1, Size=UDim2.new(0.6,0,1,0), Text=text, Font=Enum.Font.GothamBold, TextScaled=true, TextXAlignment=Enum.TextXAlignment.Left, TextColor3=Color3.fromRGB(230,230,245)})
+    local pillBtn = mk(row,"TextButton",{Size=UDim2.new(0,96,0,28), Position=UDim2.new(1,-96,0,2), Text="", AutoButtonColor=false, BackgroundColor3=Color3.fromRGB(90,90,110)})
+    mk(pillBtn,"UICorner",{CornerRadius=UDim.new(1,0)})
+    local knob = mk(pillBtn,"Frame",{Size=UDim2.new(0,24,0,24), Position=UDim2.new(0,2,0,2), BackgroundColor3=Color3.fromRGB(235,235,245)})
+    mk(knob,"UICorner",{CornerRadius=UDim.new(1,0)})
+
+    local state = initialOn and true or false
+    local function setVisual(on, animate)
+        local bgTo = on and Color3.fromRGB(0,140,90) or Color3.fromRGB(90,90,110)
+        local x = on and (96-24-2) or 2
+        if animate then
+            TweenService:Create(pillBtn, TweenInfo.new(0.15, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {BackgroundColor3 = bgTo}):Play()
+            TweenService:Create(knob,    TweenInfo.new(0.15, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {Position = UDim2.new(0, x, 0, 2)}):Play()
+        else
+            pillBtn.BackgroundColor3 = bgTo
+            knob.Position = UDim2.new(0, x, 0, 2)
+        end
+    end
+    setVisual(state, false)
+
+    local function flip()
+        state = not state
+        setVisual(state, true)
+        if onChanged then onChanged(state) end
+    end
+
+    pillBtn.MouseButton1Click:Connect(flip)
+    lbl.InputBegan:Connect(function(input) if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then flip() end end)
+    row.InputBegan:Connect(function(input) if input.UserInputType==Enum.UserInputType.Touch then flip() end end)
+
+    return row, function(on) state=on setVisual(state,false) end
+end
+
+local function buildUI()
+    local gui = mk(game:GetService("CoreGui"),"ScreenGui",{ResetOnSpawn=false, ZIndexBehavior=Enum.ZIndexBehavior.Sibling, DisplayOrder=1000})
+
+    rootWindow = mk(gui,"Frame",{
+        Size = UDim2.new(0, BASE_UI_SIZE.X, 0, BASE_UI_SIZE.Y),
+        Position = UDim2.new(0,120,0,120),
+        BackgroundColor3 = Color3.fromRGB(28,28,40),
+        ClipsDescendants = true
+    })
+    mk(rootWindow,"UICorner",{CornerRadius=UDim.new(0,12)})
+    mk(rootWindow,"UIStroke",{Color=Color3.fromRGB(68,68,92),Thickness=1})
+
+    fitRootToViewport()
+    hookViewportResize()
+
+    -- restore button (shows when minimized)
+    restoreButton = mk(gui,"TextButton",{
+        Size = UDim2.new(0,26,0,26),
+        Position = UDim2.new(0,10,0,80),
+        Text = "▣",
+        Font = Enum.Font.GothamBold,
+        TextScaled = true,
+        TextColor3 = Color3.fromRGB(255,255,255),
+        BackgroundColor3 = Color3.fromRGB(40,40,70),
+        Visible = false
+    })
+    mk(restoreButton,"UICorner",{CornerRadius=UDim.new(0,6)})
+
+    restoreButton.MouseButton1Click:Connect(function()
+        if rootWindow then
+            rootWindow.Visible = true
+            fitRootToViewport()
+        end
+        restoreButton.Visible = false
+    end)
+
+    -- Top bar
+    local top = mk(rootWindow,"Frame",{Size=UDim2.new(1,0,0,38), BackgroundColor3=Color3.fromRGB(34,34,52)})
+    mk(top,"UICorner",{CornerRadius=UDim.new(0,12)}); makeDraggable(top, rootWindow)
+
+    -- Tabs container (leave space for 2 buttons: minimize + close)
+    local tabs = mk(top,"Frame",{BackgroundTransparency=1, Size=UDim2.new(1,-72,1,-8), Position=UDim2.new(0,8,0,4)})
+    mk(tabs,"UIListLayout",{FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0,6), VerticalAlignment=Enum.VerticalAlignment.Center, HorizontalAlignment=Enum.HorizontalAlignment.Left})
+
+    local function tabButton(text, w)
+        local b = mk(tabs,"TextButton",{Size=UDim2.new(0,w or 86,0,28), Text=text, Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.new(1,1,1), BackgroundColor3=Color3.fromRGB(62,66,96)})
+        mk(b,"UICorner",{CornerRadius=UDim.new(0,8)}); return b
+    end
+    local btnMain  = tabButton("Main", 86)
+    local btnVeh   = tabButton("Vehicle", 92)
+    local btnStats = tabButton("Stats", 78)
+
+    -- Minimize + Close
+    local btnMin = mk(top,"TextButton",{Size=UDim2.new(0,28,0,28), Position=UDim2.new(1,-68,0,5), Text="-", Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.fromRGB(220,230,255), BackgroundColor3=Color3.fromRGB(70,80,110)})
+    mk(btnMin,"UICorner",{CornerRadius=UDim.new(0,8)})
+
+    local btnClose = mk(top,"TextButton",{Size=UDim2.new(0,28,0,28), Position=UDim2.new(1,-34,0,5), Text="×", Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.fromRGB(255,210,220), BackgroundColor3=Color3.fromRGB(120,60,90)})
+    mk(btnClose,"UICorner",{CornerRadius=UDim.new(0,8)})
+
+    btnMin.MouseButton1Click:Connect(function()
+        if rootWindow then rootWindow.Visible = false end
+        if restoreButton then restoreButton.Visible = true end
+    end)
+
+    -- Body
+    local body = mk(rootWindow,"Frame",{Size=UDim2.new(1,-16,1,-70), Position=UDim2.new(0,8,0,46), BackgroundTransparency=1, ClipsDescendants=true})
+    tabMain    = mk(body,"Frame",{Size=UDim2.new(1,0,1,0), BackgroundTransparency=1, Visible=false})
+    tabVehicle = mk(body,"Frame",{Size=UDim2.new(1,0,1,0), BackgroundTransparency=1, Visible=false})
+    tabStats   = mk(body,"Frame",{Size=UDim2.new(1,0,1,0), BackgroundTransparency=1, Visible=false})
+
+    -- Status bar
+    local statusBar = mk(rootWindow,"Frame",{Size=UDim2.new(1,0,0,22), Position=UDim2.new(0,0,1,-22), BackgroundColor3=Color3.fromRGB(32,32,48)})
+    statusText = mk(statusBar,"TextLabel",{BackgroundTransparency=1, Size=UDim2.new(1,-12,1,0), Position=UDim2.new(0,6,0,0), Text="Ready.", Font=Enum.Font.GothamBold, TextScaled=true, TextXAlignment=Enum.TextXAlignment.Left, TextColor3=Color3.fromRGB(170,170,190)})
+
+    -- Main tab
+    local mainStack = mk(tabMain,"Frame",{BackgroundTransparency=1, Size=UDim2.new(1,0,1,0)}); mk(mainStack,"UIListLayout",{Padding=UDim.new(0,8)})
+    activeTargetText = mk(mainStack,"TextLabel",{BackgroundTransparency=1, Size=UDim2.new(1,0,0,26), Text="Target: —", Font=Enum.Font.GothamBold, TextScaled=true, TextXAlignment=Enum.TextXAlignment.Left, TextColor3=Color3.fromRGB(230,230,245)})
+    local targetRow = mk(mainStack,"Frame",{Size=UDim2.new(1,0,0,32), BackgroundTransparency=1}); mk(targetRow,"UIListLayout",{FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0,6), VerticalAlignment=Enum.VerticalAlignment.Center})
+    targetInput = mk(targetRow,"TextBox",{Size=UDim2.new(0.65,0,1,0), Text="", PlaceholderText="Custom target or pick", Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.fromRGB(245,245,255), BackgroundColor3=Color3.fromRGB(46,48,68)}); mk(targetInput,"UICorner",{CornerRadius=UDim.new(0,8)})
+    local pickBtn = mk(targetRow,"TextButton",{Size=UDim2.new(0.33,0,1,0), Text="Pick", Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.new(1,1,1), BackgroundColor3=Color3.fromRGB(64,92,170)}); mk(pickBtn,"UICorner",{CornerRadius=UDim.new(0,8)})
+    targetsSF = mk(mainStack,"ScrollingFrame",{Size=UDim2.new(1,0,0,90), BackgroundColor3=Color3.fromRGB(30,30,48), BorderSizePixel=0, ScrollBarThickness=4, Visible=false, ClipsDescendants=true}); mk(targetsSF,"UICorner",{CornerRadius=UDim.new(0,8)})
+    targetsList = mk(targetsSF,"Frame",{BackgroundTransparency=1, Size=UDim2.new(1,-10,1,-10), Position=UDim2.new(0,5,0,5)})
+
+    local mainButtons = mk(mainStack,"Frame",{Size=UDim2.new(1,0,0,32), BackgroundTransparency=1}); mk(mainButtons,"UIListLayout",{FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0,6)})
+    local saveTarget = mk(mainButtons,"TextButton",{Size=UDim2.new(0.48,0,1,0), Text="Save Target", Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.new(1,1,1), BackgroundColor3=Color3.fromRGB(0,140,90)}); mk(saveTarget,"UICorner",{CornerRadius=UDim.new(0,8)})
+    local clearTarget = mk(mainButtons,"TextButton",{Size=UDim2.new(0.48,0,1,0), Text="Clear", Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.new(1,1,1), BackgroundColor3=Color3.fromRGB(150,90,50)}); mk(clearTarget,"UICorner",{CornerRadius=UDim.new(0,8)})
+    local runRow = mk(mainStack,"Frame",{Size=UDim2.new(1,0,0,32), BackgroundTransparency=1}); mk(runRow,"UIListLayout",{FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0,6)})
+    local btnStart = mk(runRow,"TextButton",{Size=UDim2.new(0.32,0,1,0), Text="Start", Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.new(1,1,1), BackgroundColor3=Color3.fromRGB(0,170,90)}); mk(btnStart,"UICorner",{CornerRadius=UDim.new(0,8)})
+    local btnStop  = mk(runRow,"TextButton",{Size=UDim2.new(0.32,0,1,0), Text="Stop",  Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.new(1,1,1), BackgroundColor3=Color3.fromRGB(170,90,0)}); mk(btnStop,"UICorner",{CornerRadius=UDim.new(0,8)})
+    local btnQuit  = mk(runRow,"TextButton",{Size=UDim2.new(0.32,0,1,0), Text="Quit",  Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.new(1,1,1), BackgroundColor3=Color3.fromRGB(90,0,170)}); mk(btnQuit,"UICorner",{CornerRadius=UDim.new(0,8)})
+
+    pickBtn.MouseButton1Click:Connect(function() targetsSF.Visible = not targetsSF.Visible end)
+    saveTarget.MouseButton1Click:Connect(function() local v=trim(targetInput.Text) config.savedTarget=(v~="") and v or nil saveConfig() refreshActiveTargetLabel() setStatus("Saved target.") end)
+    clearTarget.MouseButton1Click:Connect(function() config.savedTarget=nil saveConfig() refreshActiveTargetLabel() setStatus("Cleared.") end)
+    btnStart.MouseButton1Click:Connect(function() loopRunning=true setStatus("Running…") runLoop() end)
+    btnStop.MouseButton1Click:Connect(function() loopRunning=false setStatus("Stopped.") end)
+    btnQuit.MouseButton1Click:Connect(function()
+        loopRunning=false
+        stopScanner()
+        if rootWindow then rootWindow:Destroy() end
+        if restoreButton then restoreButton:Destroy() end
+    end)
+
+    -- Vehicle tab
+    local vehStack = mk(tabVehicle,"Frame",{BackgroundTransparency=1, Size=UDim2.new(1,0,1,0)}); mk(vehStack,"UIListLayout",{Padding=UDim.new(0,8)})
+
+    local function currentActive()
+        local lbl=config.activeVehicleLabel
+        if lbl and config.vehicles[lbl] then
+            return config.vehicles[lbl], ("Active: %s"):format(lbl)
+        end
+        local preset, whyPreset = getPresetUUIDForLocal()
+        if preset then
+            return preset, whyPreset
+        end
+        if lastDetectedUUID ~= "" then
+            return lastDetectedUUID, "Base (last detected)"
+        end
+        return "—","None"
+    end
+
+    local u0,w0=currentActive()
+    vehicleActiveText   = mk(vehStack,"TextLabel",{BackgroundTransparency=1, Size=UDim2.new(1,0,0,26), Text=("Active Vehicle: %s  •  %s"):format(u0 or "—", w0), Font=Enum.Font.GothamBold, TextScaled=true, TextXAlignment=Enum.TextXAlignment.Left, TextColor3=Color3.fromRGB(230,230,245)})
+    vehicleDetectedText = mk(vehStack,"TextLabel",{BackgroundTransparency=1, Size=UDim2.new(1,0,0,24), Text="Detected UUID: —", Font=Enum.Font.GothamBold, TextScaled=true, TextXAlignment=Enum.TextXAlignment.Left, TextColor3=Color3.fromRGB(230,230,245)})
+
+    local _, setToggleVisual = buildPillToggle(vehStack, "UUID Detect", config.detectUuid, function(on)
+        config.detectUuid = on; saveConfig()
+        if on then vehicleDetectedText.Text = "Detected UUID: "..(nonEmpty(lastDetectedUUID) and lastDetectedUUID or "—")
+        else vehicleDetectedText.Text = "Detected UUID: — (disabled)" end
+    end)
+    setToggleVisual(config.detectUuid)
+
+    local rowUUID = mk(vehStack,"Frame",{Size=UDim2.new(1,0,0,32), BackgroundTransparency=1}); mk(rowUUID,"UIListLayout",{FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0,6)})
+    local uuidInput = mk(rowUUID,"TextBox",{Size=UDim2.new(0.65,0,1,0), Text="", PlaceholderText="UUID (optional: paste or leave blank)", Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.fromRGB(245,245,255), BackgroundColor3=Color3.fromRGB(46,48,68)}); mk(uuidInput,"UICorner",{CornerRadius=UDim.new(0,8)})
+    local btnPaste = mk(rowUUID,"TextButton",{Size=UDim2.new(0.33,0,1,0), Text="Paste from clipboard", Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.new(1,1,1), BackgroundColor3=Color3.fromRGB(64,92,170)}); mk(btnPaste,"UICorner",{CornerRadius=UDim.new(0,8)})
+    btnPaste.MouseButton1Click:Connect(function() local clip=safeGetClipboard() if clip and #trim(clip)>=8 then uuidInput.Text=trim(clip) setStatus("Pasted UUID from clipboard.") else setStatus("Clipboard empty/unavailable.") end end)
+
+    local rowLabel = mk(vehStack,"Frame",{Size=UDim2.new(1,0,0,32), BackgroundTransparency=1}); mk(rowLabel,"UIListLayout",{FillDirection=Enum.FillDirection.Horizontal, Padding=UDim.new(0,6)})
+    local vehicleLabelInput = mk(rowLabel,"TextBox",{Size=UDim2.new(0.65,0,1,0), Text="", PlaceholderText="Label (e.g. Jet#1)", Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.fromRGB(245,245,255), BackgroundColor3=Color3.fromRGB(46,48,68)}); mk(vehicleLabelInput,"UICorner",{CornerRadius=UDim.new(0,8)})
+    local btnSaveUUID = mk(rowLabel,"TextButton",{Size=UDim2.new(0.33,0,1,0), Text="Save UUID", Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.new(1,1,1), BackgroundColor3=Color3.fromRGB(0,140,90)}); mk(btnSaveUUID,"UICorner",{CornerRadius=UDim.new(0,8)})
+
+    local function getUUIDForSaving()
+        if nonEmpty(uuidInput.Text)   then return trim(uuidInput.Text), "manual" end
+        if nonEmpty(lastDetectedUUID) then return lastDetectedUUID, "detected" end
+        local preset,_ = getPresetUUIDForLocal()
+        if nonEmpty(preset) then return preset, "preset" end
+        local lbl=config.activeVehicleLabel local u=lbl and config.vehicles[lbl] or nil
+        if nonEmpty(u) then return u, "active" end
+        return nil, "none"
+    end
+
+    btnSaveUUID.MouseButton1Click:Connect(function()
+        local label=trim(vehicleLabelInput.Text) local uuid,src=getUUIDForSaving()
+        if not nonEmpty(label) then setStatus("Need label.") return end
+        if not nonEmpty(uuid)  then setStatus("No UUID yet. Paste, use preset, or spawn once.") return end
+        config.vehicles[label]=uuid config.activeVehicleLabel=label saveConfig()
+        uuidInput.Text, vehicleLabelInput.Text = "", ""
+        rebuildVehiclesList()
+        vehicleActiveText.Text=("Active Vehicle: %s  •  %s"):format(uuid,"Active: "..label)
+        setStatus(("UUID saved (%s)."):format(src))
+    end)
+
+    vehiclesSF = mk(vehStack,"ScrollingFrame",{Size=UDim2.new(1,0,0,140), BackgroundColor3=Color3.fromRGB(30,30,48), BorderSizePixel=0, ScrollBarThickness=4, ClipsDescendants=true}); mk(vehiclesSF,"UICorner",{CornerRadius=UDim.new(0,8)})
+    vehiclesList = mk(vehiclesSF,"Frame",{BackgroundTransparency=1, Size=UDim2.new(1,-10,1,-10), Position=UDim2.new(0,5,0,5)})
+    local testRow = mk(vehStack,"Frame",{Size=UDim2.new(1,0,0,32), BackgroundTransparency=1})
+    local btnTest = mk(testRow,"TextButton",{Size=UDim2.new(1,0,1,0), Text="Test Spawn (Active/Preset/Base UUID)", Font=Enum.Font.GothamBold, TextScaled=true, TextColor3=Color3.new(1,1,1), BackgroundColor3=Color3.fromRGB(60,90,170)}); mk(btnTest,"UICorner",{CornerRadius=UDim.new(0,8)})
+    btnTest.MouseButton1Click:Connect(function() spawnVehicleUuid() end)
+
+    -- Stats tab
+    local statStack = mk(tabStats,"Frame",{BackgroundTransparency=1, Size=UDim2.new(1,0,1,0)}); mk(statStack,"UIListLayout",{Padding=UDim.new(0,8)})
+    totalXPLabel     = mk(statStack,"TextLabel",{BackgroundTransparency=1, Size=UDim2.new(1,0,0,26), Text="Total XP: 0", Font=Enum.Font.GothamBold, TextScaled=true, TextXAlignment=Enum.TextXAlignment.Left, TextColor3=Color3.fromRGB(230,230,245)})
+    avgDeathLabel    = mk(statStack,"TextLabel",{BackgroundTransparency=1, Size=UDim2.new(1,0,0,26), Text="Avg Death: 0s", Font=Enum.Font.GothamBold, TextScaled=true, TextXAlignment=Enum.TextXAlignment.Left, TextColor3=Color3.fromRGB(230,230,245)})
+    sessionTimeLabel = mk(statStack,"TextLabel",{BackgroundTransparency=1, Size=UDim2.new(1,0,0,26), Text="Session: 0h 0m", Font=Enum.Font.GothamBold, TextScaled=true, TextXAlignment=Enum.TextXAlignment.Left, TextColor3=Color3.fromRGB(230,230,245)})
+    lastActionLabel  = mk(statStack,"TextLabel",{BackgroundTransparency=1, Size=UDim2.new(1,0,0,26), Text="Last: Ready.", Font=Enum.Font.GothamBold, TextScaled=true, TextXAlignment=Enum.TextXAlignment.Left, TextColor3=Color3.fromRGB(200,200,220)})
+
+    -- Tab switching
+    showTab = function(which)
+        tabMain.Visible    = (which=="Main")
+        tabVehicle.Visible = (which=="Vehicle")
+        tabStats.Visible   = (which=="Stats")
+    end
+    btnMain.MouseButton1Click:Connect(function() showTab("Main") end)
+    btnVeh.MouseButton1Click:Connect(function() showTab("Vehicle") end)
+    btnStats.MouseButton1Click:Connect(function() showTab("Stats") end)
+
+    btnClose.MouseButton1Click:Connect(function()
+        loopRunning=false
+        stopScanner()
+        if rootWindow then rootWindow:Destroy() end
+        if restoreButton then restoreButton:Destroy() end
+        gui:Destroy()
+    end)
+
+    targetsSF.Visible=false
+    rebuildTargetsList()
+    rebuildVehiclesList()
+end
+
+-- ===== Tycoon auto-select bypass =====
+local function autoSelectTycoon()
+    if not AUTO_SELECT_TYCOON then return end
+    task.delay(SELECT_DELAY_SEC, function()
+        local ok, err = pcall(function()
+            local args_start = { [1] = TYCOON_REGION }
+            RS:WaitForChild("Packages", 9e9)
+              :WaitForChild("_Index",   9e9)
+              :WaitForChild("sleitnick_knit@1.5.1", 9e9)
+              :WaitForChild("knit",     9e9)
+              :WaitForChild("Services", 9e9)
+              :WaitForChild("TycoonService", 9e9)
+              :WaitForChild("RF",       9e9)
+              :WaitForChild("Select",   9e9)
+              :InvokeServer(unpack(args_start))
+        end)
+        if ok then setStatus(("Tycoon auto-selected: %s"):format(TYCOON_REGION))
+        else setStatus(("Tycoon auto-select failed: %s"):format(tostring(err))) end
+    end)
+end
+
+-- ===== Resets when target/player leaves =====
+Players.PlayerRemoving:Connect(function(p)
+    if scanTarget and p.Name == scanTarget then
+        stopScanner()
+        clearSaved(p.Name)
+    end
+end)
+
+-- ===== Boot & runner =====
+loadConfig()
+buildUI()
+
+showTab(START_TAB or "Stats")
+refreshActiveTargetLabel()
+if vehicleDetectedText then
+    vehicleDetectedText.Text = config.detectUuid and ("Detected UUID: "..(nonEmpty(lastDetectedUUID) and lastDetectedUUID or "—")) or "Detected UUID: — (disabled)"
+end
+updateStatsGUI()
+autoSelectTycoon()
+
+if AUTO_START then
+    loopRunning=true setStatus("Auto-starting…") runLoop()
+    task.defer(function() local _=LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait() fullFlight() end)
+end
+
+task.spawn(function() while true do updateStatsGUI() RunService.Heartbeat:Wait() end end)
