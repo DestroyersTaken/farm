@@ -393,12 +393,14 @@ local function startScanner(name)
 end
 
 -- ===== Movement =====
-local function waitForShieldGone(char)
+local function waitForShieldGone(timeoutSecs)
     setStatus("Waiting for shield…")
     local t0 = tick()
     local gone = false
-    while tick() - t0 < 10 do
-        local ff = char:FindFirstChildWhichIsA("ForceField")
+    local timeout = timeoutSecs or 8
+    while tick() - t0 < timeout do
+        local char = LocalPlayer.Character
+        local ff = char and char:FindFirstChildWhichIsA("ForceField")
         if not ff then
             gone = true
             break
@@ -406,6 +408,66 @@ local function waitForShieldGone(char)
         RunService.Heartbeat:Wait()
     end
     setStatus(gone and "Shield gone." or "Shield timeout, proceed.")
+    return gone
+end
+
+local function anchoredShieldWaitAboveTarget(targetPos, waitHeight)
+    local holdY = (waitHeight or 100)
+    local holdPos = Vector3.new(targetPos.X, targetPos.Y + holdY, targetPos.Z)
+
+    local hrp = tpTo(holdPos)
+    local t0 = tick()
+    local timeout = 8
+
+    while tick() - t0 < timeout do
+        local char = LocalPlayer.Character
+        if not char then break end
+
+        local ff = char:FindFirstChildWhichIsA("ForceField")
+        if not ff then
+            break
+        end
+
+        local currentHrp = char:FindFirstChild("HumanoidRootPart")
+        if currentHrp then
+            hrp = currentHrp
+            hrp.Anchored = true
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            hrp.CFrame = CFrame.new(holdPos)
+        end
+
+        RunService.Heartbeat:Wait()
+    end
+
+    local finalChar = LocalPlayer.Character
+    local finalHrp = finalChar and finalChar:FindFirstChild("HumanoidRootPart")
+    if finalHrp then
+        finalHrp.Anchored = false
+    end
+
+    waitForShieldGone(8)
+
+    return finalHrp or hrp
+end
+
+local function pickSafeGroundNearTarget(targetPos, minDist, maxDist)
+    local minR = minDist or 55
+    local maxR = math.max(minR + 1, maxDist or 105)
+
+    local fallbackG = nil
+    for _ = 1, 6 do
+        local offX, offZ = ringOffset(minR, maxR)
+        local g = groundAt(targetPos.X + offX, targetPos.Z + offZ)
+        fallbackG = fallbackG or g
+
+        local planarDist = (Vector3.new(g.X, 0, g.Z) - Vector3.new(targetPos.X, 0, targetPos.Z)).Magnitude
+        if planarDist >= minR then
+            return g
+        end
+    end
+
+    return fallbackG or groundAt(targetPos.X + minR, targetPos.Z)
 end
 
 local function descendDown(hrp)
@@ -471,13 +533,12 @@ local function goToSavedOrFlag(name)
     -- If we already have a fresh saved position, just go near it
     local fresh = getFreshSaved(name)
     if fresh then
-        local offX, offZ = ringOffset(35, 85)
-        local g = groundAt(fresh.X + offX, fresh.Z + offZ)
-        setStatus(("TP near saved %s…"):format(name))
-        local hrp = tpTo(Vector3.new(g.X, g.Y + 6, g.Z))
+        setStatus(("Holding above saved %s while shield is active…"):format(name))
+        anchoredShieldWaitAboveTarget(fresh, 100)
 
-        local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-        waitForShieldGone(char)
+        local g = pickSafeGroundNearTarget(fresh, 55, 105)
+        setStatus(("TP near saved %s (post-shield)…"):format(name))
+        local hrp = tpTo(Vector3.new(g.X, g.Y + 6, g.Z))
 
         hrp.Anchored = false
         descendDown(hrp)
@@ -513,13 +574,12 @@ local function goToSavedOrFlag(name)
         return false
     end
 
-    local offX2, offZ2 = ringOffset(35, 85)
-    local g2 = groundAt(saved.X + offX2, saved.Z + offZ2)
-    setStatus(("TP near live %s…"):format(name))
-    local hrp = tpTo(Vector3.new(g2.X, g2.Y + 6, g2.Z))
+    setStatus(("Holding above live %s while shield is active…"):format(name))
+    anchoredShieldWaitAboveTarget(saved, 100)
 
-    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-    waitForShieldGone(char)
+    local g2 = pickSafeGroundNearTarget(saved, 55, 105)
+    setStatus(("TP near live %s (post-shield)…"):format(name))
+    local hrp = tpTo(Vector3.new(g2.X, g2.Y + 6, g2.Z))
 
     hrp.Anchored = false
     descendDown(hrp)
