@@ -2,7 +2,7 @@
 -- Target flow: FLAG → HOVER & SCAN (while shield) → SAVE (memory) → TP to SAVED → background rescan.
 -- If SAVED stale/missing → back to FLAG. lastPos is in-memory ONLY (resets on rejoin).
 
--- ===== Services =====
+-- ====== Initialization of services ======
 local Players      = game:GetService("Players")
 local RS           = game:GetService("ReplicatedStorage")
 local UIS          = game:GetService("UserInputService")
@@ -11,6 +11,80 @@ local RunService   = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local Workspace    = game:GetService("Workspace")
 local LocalPlayer  = Players.LocalPlayer
+
+-- ====== Utility functions ======
+local function setStatus(msg)
+    -- Implement your status update logic here, e.g., print or UI update
+end
+
+-- ====== Define all functions BEFORE usage, especially those called early ======
+
+local function initializeFunctions()
+    -- Wait for shield to be gone
+    local function waitForShieldGone(char, timeoutSecs)
+        setStatus("Waiting for shield…")
+        local t0 = tick()
+        local gone = false
+        local timeout = timeoutSecs or 20
+        while tick() - t0 < timeout do
+            local ff = char:FindFirstChildWhichIsA("ForceField")
+            if not ff then
+                gone = true
+                break
+            end
+            RunService.Heartbeat:Wait()
+        end
+        setStatus(gone and "Shield gone." or "Shield timeout, proceed.")
+    end
+
+    -- Teleport to position
+    local function tpTo(v3)
+        local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+        local hrp  = char:WaitForChild("HumanoidRootPart")
+        local goal = Vector3.new(v3.X, v3.Y, v3.Z)
+        local ok = pcall(function() LocalPlayer.Character:SetPrimaryPartCFrame(CFrame.new(goal)) end)
+        if not ok or (hrp.Position - goal).Magnitude > 14 then
+            hrp.CFrame = CFrame.new(goal)
+        end
+        return hrp
+    end
+
+    -- Wait above target while shield is active
+    local function anchoredShieldWaitAboveTarget(targetPos, waitHeight)
+        local holdY = (waitHeight or 100)
+        local holdPos = Vector3.new(targetPos.X, targetPos.Y + holdY, targetPos.Z)
+        local hrp = tpTo(holdPos)
+        hrp.Anchored = true
+
+        local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+        waitForShieldGone(char, 20)
+
+        hrp.Anchored = false
+        return hrp
+    end
+
+    -- Assign to global table for access
+    _G.waitForShieldGone = waitForShieldGone
+    _G.tpTo = tpTo
+    _G.anchoredShieldWaitAboveTarget = anchoredShieldWaitAboveTarget
+end
+
+-- Call this early to define functions
+initializeFunctions()
+
+-- ====== Rest of your script, which uses the above functions ======
+
+-- Example usage of anchoredShieldWaitAboveTarget
+-- Make sure to call this after initializeFunctions()
+local function goToSavedOrFlag(name)
+    -- Example call to the fixed function
+    if _G.anchoredShieldWaitAboveTarget then
+        -- Replace 'saved' with actual position Vector3 as needed
+        _G.anchoredShieldWaitAboveTarget(saved, 100)
+    else
+        setStatus("Error: anchoredShieldWaitAboveTarget not available")
+    end
+end
 
 -- ===== Default per-user UUID presets =====
 local DEFAULT_UUIDS = {
@@ -28,7 +102,6 @@ local DEFAULT_UUIDS = {
     ["sinead8053"]	  = "92ca06fc-b80a-4d2d-8559-be6433e3ae9f",
     ["leroy9985"]	  = "2248fcc0-5df4-402c-a914-24e0de3adbc7",
     ["selah077056"]	  = "eff84867-e8bc-46ec-8610-7a0016c8d665",
-
 }
 
 local function getPresetUUIDForLocal()
@@ -393,69 +466,23 @@ local function startScanner(name)
 end
 
 -- ===== Movement =====
-local function waitForShieldGone(timeoutSecs)
-    setStatus("Waiting for shield…")
-    local t0 = tick()
-    local gone = false
-    local timeout = timeoutSecs or 8
-    while tick() - t0 < timeout do
-        local char = LocalPlayer.Character
-        local ff = char and char:FindFirstChildWhichIsA("ForceField")
-        if not ff then
-            gone = true
-            break
-        end
-        RunService.Heartbeat:Wait()
-    end
-    setStatus(gone and "Shield gone." or "Shield timeout, proceed.")
-    return gone
-end
-
-local function anchoredShieldWaitAboveTarget(targetPos, waitHeight)
-    local holdY = (waitHeight or 100)
-    local holdPos = Vector3.new(targetPos.X, targetPos.Y + holdY, targetPos.Z)
-
-    local hrp = tpTo(holdPos)
-    local t0 = tick()
-    local timeout = 8
-
-    while tick() - t0 < timeout do
-        local char = LocalPlayer.Character
-        if not char then break end
-
-        local ff = char:FindFirstChildWhichIsA("ForceField")
-        if not ff then
-            break
-        end
-
-        local currentHrp = char:FindFirstChild("HumanoidRootPart")
-        if currentHrp then
-            hrp = currentHrp
-            hrp.Anchored = true
-            hrp.AssemblyLinearVelocity = Vector3.zero
-            hrp.AssemblyAngularVelocity = Vector3.zero
-            hrp.CFrame = CFrame.new(holdPos)
-        end
-
-        RunService.Heartbeat:Wait()
-    end
-
-    local finalChar = LocalPlayer.Character
-    local finalHrp = finalChar and finalChar:FindFirstChild("HumanoidRootPart")
-    if finalHrp then
-        finalHrp.Anchored = false
-    end
-
-    waitForShieldGone(8)
-
-    return finalHrp or hrp
-end
 local function waitForShieldGone(char, timeoutSecs)
+    if not char then
+        setStatus("No character for shield check.")
+        return
+    end
+    
     setStatus("Waiting for shield…")
     local t0 = tick()
     local gone = false
     local timeout = timeoutSecs or 20
+    
     while tick() - t0 < timeout do
+        if not char or not char.Parent then
+            setStatus("Character died/despawned during shield wait.")
+            return
+        end
+        
         local ff = char:FindFirstChildWhichIsA("ForceField")
         if not ff then
             gone = true
@@ -463,42 +490,64 @@ local function waitForShieldGone(char, timeoutSecs)
         end
         RunService.Heartbeat:Wait()
     end
+    
     setStatus(gone and "Shield gone." or "Shield timeout, proceed.")
 end
 
 local function anchoredShieldWaitAboveTarget(targetPos, waitHeight)
+    if not targetPos then
+        setStatus("Error: No target position for anchored wait.")
+        return nil
+    end
+    
     local holdY = (waitHeight or 100)
     local holdPos = Vector3.new(targetPos.X, targetPos.Y + holdY, targetPos.Z)
+    
+    -- DEFENSIVE: Get character before calling tpTo
+    local char = LocalPlayer.Character
+    if not char then
+        char = LocalPlayer.CharacterAdded:Wait()
+    end
+    if not char or not char.Parent then
+        setStatus("Error: No valid character for TP.")
+        return nil
+    end
+    
     local hrp = tpTo(holdPos)
-    hrp.Anchored = true
+    if not hrp or not hrp.Parent then
+        setStatus("Error: Could not TP (HRP invalid/lost).")
+        warn("anchoredShieldWaitAboveTarget: tpTo failed or HRP lost. Position:", holdPos)
+        return nil
+    end
 
-    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    -- Safely anchor
+    local ok = pcall(function() hrp.Anchored = true end)
+    if not ok then
+        setStatus("Error: Could not anchor HRP.")
+        return nil
+    end
+
+    -- Wait for shield to be gone
+    char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    if not char then
+        setStatus("Error: Character lost during shield wait.")
+        pcall(function() hrp.Anchored = false end)
+        return nil
+    end
+    
     waitForShieldGone(char, 20)
 
-    hrp.Anchored = false
+    -- Unanchor safely
+    if hrp and hrp.Parent then
+        pcall(function() hrp.Anchored = false end)
+    end
+    
     return hrp
 end
 
 local function pickSafeGroundNearTarget(targetPos, minDist, maxDist)
-    local minR = minDist or 55
-    local maxR = math.max(minR + 1, maxDist or 105)
-
-    local fallbackG = nil
-    for _ = 1, 6 do
-        local offX, offZ = ringOffset(minR, maxR)
-        local g = groundAt(targetPos.X + offX, targetPos.Z + offZ)
-        fallbackG = fallbackG or g
-
-        local planarDist = (Vector3.new(g.X, 0, g.Z) - Vector3.new(targetPos.X, 0, targetPos.Z)).Magnitude
-        if planarDist >= minR then
-            return g
-        end
-    end
-
-    return fallbackG or groundAt(targetPos.X + minR, targetPos.Z)
-end
-
-local function pickSafeGroundNearTarget(targetPos, minDist, maxDist)
+    if not targetPos then return nil end
+    
     local minR = minDist or 55
     local maxR = math.max(minR + 1, maxDist or 105)
 
@@ -518,29 +567,91 @@ local function pickSafeGroundNearTarget(targetPos, minDist, maxDist)
 end
 
 local function descendDown(hrp)
-    setStatus("Descending…"); hrp.Anchored=false
-    local rp=RaycastParams.new() rp.FilterDescendantsInstances={LocalPlayer.Character} rp.FilterType=Enum.RaycastFilterType.Blacklist
+    if not hrp then
+        setStatus("Error: No HRP for descent.")
+        return
+    end
+    
+    if not hrp.Parent then
+        setStatus("Error: HRP lost before descent.")
+        return
+    end
+    
+    setStatus("Descending…")
+    local ok = pcall(function() hrp.Anchored = false end)
+    if not ok then
+        setStatus("Error: Could not unanchor HRP for descent.")
+        return
+    end
+    
+    local rp=RaycastParams.new() 
+    rp.FilterDescendantsInstances={LocalPlayer.Character} 
+    rp.FilterType=Enum.RaycastFilterType.Blacklist
     local t0=tick()
+    
     while tick()-t0<10 do
+        if not hrp or not hrp.Parent then
+            setStatus("HRP lost during descent.")
+            return
+        end
+        
         local res=Workspace:Raycast(hrp.Position, Vector3.new(0,-50,0), rp)
         if res then
             local targetY=res.Position.Y+5
-            if hrp.Position.Y - targetY <= 5 then hrp.CFrame=CFrame.new(hrp.Position.X, targetY, hrp.Position.Z) break
-            else local dt=RunService.Heartbeat:Wait() hrp.CFrame=hrp.CFrame-Vector3.new(0,50*dt,0) end
-        else local dt=RunService.Heartbeat:Wait() hrp.CFrame=hrp.CFrame-Vector3.new(0,50*dt,0) end
+            if hrp.Position.Y - targetY <= 5 then 
+                pcall(function() hrp.CFrame=CFrame.new(hrp.Position.X, targetY, hrp.Position.Z) end)
+                break
+            else 
+                local dt=RunService.Heartbeat:Wait() 
+                pcall(function() hrp.CFrame=hrp.CFrame-Vector3.new(0,50*dt,0) end)
+            end
+        else 
+            local dt=RunService.Heartbeat:Wait() 
+            pcall(function() hrp.CFrame=hrp.CFrame-Vector3.new(0,50*dt,0) end)
+        end
     end
 end
 
 -- ===== Teleport primitives =====
 -- NOTE: this is a *raw* TP; no shield waiting here anymore.
 local function tpTo(v3)
-    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-    local hrp  = char:WaitForChild("HumanoidRootPart")
-    local goal = Vector3.new(v3.X, v3.Y, v3.Z)
-    local ok = pcall(function() LocalPlayer.Character:SetPrimaryPartCFrame(CFrame.new(goal)) end)
-    if not ok or (hrp.Position - goal).Magnitude > 14 then
-        hrp.CFrame = CFrame.new(goal)
+    if not v3 then
+        warn("tpTo called with nil Vector3")
+        return nil
     end
+    
+    local char = LocalPlayer.Character
+    if not char or not char.Parent then
+        char = LocalPlayer.CharacterAdded:Wait()
+    end
+    if not char or not char.Parent then
+        warn("tpTo: Could not get valid character")
+        return nil
+    end
+    
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp or not hrp.Parent then
+        warn("tpTo: HumanoidRootPart not found or invalid")
+        return nil
+    end
+    
+    local goal = Vector3.new(v3.X, v3.Y, v3.Z)
+    local ok = pcall(function() 
+        if LocalPlayer.Character then
+            LocalPlayer.Character:SetPrimaryPartCFrame(CFrame.new(goal)) 
+        end
+    end)
+    
+    if ok then
+        if (hrp.Position - goal).Magnitude > 14 then
+            pcall(function() hrp.CFrame = CFrame.new(goal) end)
+        end
+    else
+        pcall(function() hrp.CFrame = CFrame.new(goal) end)
+    end
+    
+    -- Final validation
+    if not hrp or not hrp.Parent then return nil end
     return hrp
 end
 
@@ -548,11 +659,19 @@ end
 
 -- helper: while we still have shield, keep scanning target to save its pos
 local function scanWhileShieldAndSave(name, maxSecs)
+    if not name then return false end
+    
     local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    if not char or not char.Parent then return false end
+    
     local deadline = now() + (maxSecs or 10)
     local savedOnce = false
 
     while now() < deadline do
+        if not char or not char.Parent then
+            break
+        end
+        
         local ff = char:FindFirstChildWhichIsA("ForceField")
         if not ff then
             -- shield gone, stop loop
@@ -577,17 +696,37 @@ end
 -- 3) Start scanner
 -- 4) When shield is gone, TP near saved target & land
 local function goToSavedOrFlag(name)
+    if not name then
+        setStatus("No target name provided.")
+        return false
+    end
+    
     -- If we already have a fresh saved position, just go near it
     local fresh = getFreshSaved(name)
     if fresh then
         setStatus(("Holding above saved %s while shield is active…"):format(name))
-        anchoredShieldWaitAboveTarget(fresh, 100)
+        
+        local hrp_result = anchoredShieldWaitAboveTarget(fresh, 100)
+        if not hrp_result then
+            setStatus(("Shield wait failed for %s, retrying…"):format(name))
+            return false
+        end
 
         local g = pickSafeGroundNearTarget(fresh, 55, 105)
+        if not g then
+            setStatus("Could not pick safe ground.")
+            return false
+        end
+        
         setStatus(("TP near saved %s (post-shield)…"):format(name))
         local hrp = tpTo(Vector3.new(g.X, g.Y + 6, g.Z))
+        
+        if not hrp then
+            setStatus("Failed to TP near saved position.")
+            return false
+        end
 
-        hrp.Anchored = false
+        pcall(function() hrp.Anchored = false end)
         descendDown(hrp)
         return true
     end
@@ -602,7 +741,7 @@ local function goToSavedOrFlag(name)
     local base = flag.Position
     local offX, offZ = ringOffset(35, 85)
     local g = groundAt(base.X + offX, base.Z + offZ)
-    local hover = Vector3.new(g.X, g.Y + 75, g.Z) -- hover higher so we don't get stuck in ground
+    local hover = Vector3.new(g.X, g.Y + 75, g.Z)
 
     setStatus(("TP above flag (%s)…"):format(name))
     tpTo(hover)
@@ -622,13 +761,28 @@ local function goToSavedOrFlag(name)
     end
 
     setStatus(("Holding above live %s while shield is active…"):format(name))
-    anchoredShieldWaitAboveTarget(saved, 100)
+    
+    local hrp_result = anchoredShieldWaitAboveTarget(saved, 100)
+    if not hrp_result then
+        setStatus(("Shield wait failed for %s, retrying…"):format(name))
+        return false
+    end
 
     local g2 = pickSafeGroundNearTarget(saved, 55, 105)
+    if not g2 then
+        setStatus("Could not pick safe ground for final landing.")
+        return false
+    end
+    
     setStatus(("TP near live %s (post-shield)…"):format(name))
     local hrp = tpTo(Vector3.new(g2.X, g2.Y + 6, g2.Z))
+    
+    if not hrp then
+        setStatus("Failed to TP to final position.")
+        return false
+    end
 
-    hrp.Anchored = false
+    pcall(function() hrp.Anchored = false end)
     descendDown(hrp)
     return true
 end
@@ -674,7 +828,12 @@ local function fullFlight()
     end
 
     local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-    char:WaitForChild("HumanoidRootPart") -- just ensure loaded
+    if not char or not char.Parent then
+        setStatus("Character not available.")
+        return
+    end
+    
+    char:WaitForChild("HumanoidRootPart", 5)
 
     if not spawnVehicleUuid() then
         task.wait(0.6)
@@ -698,7 +857,17 @@ local function registerDeath(nowTime)
 end
 local function waitUntilDead()
     local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-    local hum  = char:WaitForChild("Humanoid")
+    if not char or not char.Parent then
+        setStatus("No character to wait on.")
+        return false
+    end
+    
+    local hum  = char:WaitForChild("Humanoid", 5)
+    if not hum then
+        setStatus("No humanoid found.")
+        return false
+    end
+    
     if hum.Health<=0 then registerDeath(now()) return true end
     local died=false; local conn; conn=hum.Died:Connect(function() died=true end)
     local t0=tick() while not died and tick()-t0<20 do RunService.Heartbeat:Wait() end
