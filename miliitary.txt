@@ -466,6 +466,9 @@ local function startScanner(name)
 end
 
 -- ===== Movement =====
+-- Forward declaration so movement helpers call the raw TP helper below.
+local tpTo
+
 local function waitForShieldGone(char, timeoutSecs)
     if not char then
         setStatus("No character for shield check.")
@@ -513,7 +516,14 @@ local function anchoredShieldWaitAboveTarget(targetPos, waitHeight)
         return nil
     end
     
-    local hrp = tpTo(holdPos)
+    local tpFn = tpTo or _G.tpTo
+    if typeof(tpFn) ~= "function" then
+        setStatus("Error: tpTo function is unavailable.")
+        warn("anchoredShieldWaitAboveTarget: tpTo is nil")
+        return nil
+    end
+
+    local hrp = tpFn(holdPos)
     if not hrp or not hrp.Parent then
         setStatus("Error: Could not TP (HRP invalid/lost).")
         warn("anchoredShieldWaitAboveTarget: tpTo failed or HRP lost. Position:", holdPos)
@@ -614,7 +624,7 @@ end
 
 -- ===== Teleport primitives =====
 -- NOTE: this is a *raw* TP; no shield waiting here anymore.
-local function tpTo(v3)
+tpTo = function(v3)
     if not v3 then
         warn("tpTo called with nil Vector3")
         return nil
